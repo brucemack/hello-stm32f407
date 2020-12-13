@@ -43,7 +43,9 @@
 I2C_HandleTypeDef hi2c1;
 
 I2S_HandleTypeDef hi2s2;
+I2S_HandleTypeDef hi2s3;
 DMA_HandleTypeDef hdma_spi2_tx;
+DMA_HandleTypeDef hdma_spi3_rx;
 
 UART_HandleTypeDef huart1;
 
@@ -58,6 +60,7 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2S2_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_I2S3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -89,15 +92,21 @@ static const int blockSize = FILTER_BLOCK_SIZE;
 // - There is space for two blocks.  The DMA works on one block while
 //   the other block is being processed, and then we flip to the other side.
 //
-static uint16_t out_data[FILTER_BLOCK_SIZE * 8];
+static volatile uint16_t out_data[FILTER_BLOCK_SIZE * 8];
+static volatile uint16_t in_data[FILTER_BLOCK_SIZE * 8];
+
+// A circular data transfer queue loaded from the input DMA interrupt and read from
+// the output DMA interrupt.  This queue contains signed and properly scaled values.
+static const int queueSize = FILTER_BLOCK_SIZE * 2 + 1;
+static volatile int32_t queue[FILTER_BLOCK_SIZE * 2 + 1];
+// Pointers for the queue
+static volatile int queue_write_ptr = 0;
+static volatile int queue_read_ptr = 0;
 
 static void setSynthFreq(float freqHz) {
 	float phasePerSample = (freqHz / fs) * 2.0 * 3.14159;
 	lutStep = (phasePerSample / (2.0 * 3.1415926)) * lut_size;
 }
-
-float ramp = 0;
-
 
 static void moveOut(int base) {
 
@@ -110,16 +119,20 @@ static void moveOut(int base) {
 
 	// Take the synthesized cosine and load it into the filter input area
 	for (int i = 0; i < blockSize; i++) {
+
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
-		lutPtr = (lutPtr + lutStep) & 0xff;
-		filterOut[i] = amp * lut[lutPtr] * gain;
+		//lutPtr = (lutPtr + lutStep) & 0xff;
+		//filterOut[i] = amp * lut[lutPtr] * gain;
 
-		//filterOut[i] = amp * ramp * gain;
-		//ramp += 0.001;
-		//if (ramp > 1.0) {
-		//	ramp = 0;
-		//}
+		// Move the sampled data into the arrays that will be processed by
+		// the DSP functions.  This is a case from a signed integer to
+		// a float32.
+		filterOut[i] = queue[queue_read_ptr++];
+		// Look for the wrap
+		if (queue_read_ptr == queueSize) {
+			queue_read_ptr = 0;
+		}
 	}
 
 	// Generate the output signals
@@ -131,11 +144,48 @@ static void moveOut(int base) {
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 		// RIGHT CHANNEL
-		ci = filterOut[i] * balance;
-		hi = (ci >> 16) & 0xffff;
-		lo = ci & 0xffff;
-		out_data[out_ptr++] = hi;
-		out_data[out_ptr++] = lo;
+		out_data[out_ptr++] = 0;
+		out_data[out_ptr++] = 0;
+	}
+}
+
+int ramp = 0;
+
+// This read half of the inbound data from the DMA buffer.  This is
+// called by the DMA interrupt at the half-way point through the
+// entire DMA buffer.
+static void moveIn(int base) {
+
+	int in_ptr = base;
+	int32_t sample;
+
+	for (int i = 0; i < blockSize; i++) {
+
+		// Read the left channel into the receive queue.
+		// Load the high end of the sample into the high end of the 32-bit number
+		uint16_t s = in_data[in_ptr++];
+		sample = s;
+		// Shift up
+		sample = sample << 16;
+		// Add low end of sample
+		s = in_data[in_ptr++];
+		sample |= s;
+
+		// Generate synthesized data by stepping through the cosine table
+		// This handles the wrapping of the LUT pointer:
+		//lutPtr = (lutPtr + lutStep) & 0xff;
+		//int32_t sample = amp * lut[lutPtr] * gain;
+
+		// Queue the sample for processing
+		queue[queue_write_ptr++] = sample;
+		// Look for the wrap
+		if (queue_write_ptr == queueSize) {
+			queue_write_ptr = 0;
+		}
+
+		// Ignore the right channel input
+		in_ptr++;
+		in_ptr++;
 	}
 }
 
@@ -149,13 +199,34 @@ void HAL_I2S_TxCpltCallback (I2S_HandleTypeDef * hi2s) {
 	moveOut(blockSize * 4);
 }
 
+// Called at the half-way point.  Fills in the first half of the DMA area.
+void HAL_I2S_RxHalfCpltCallback (I2S_HandleTypeDef * hi2s) {
+	moveIn(0);
+}
+
+// Called at the end point.  Fills in the second half of the DMA area.
+void HAL_I2S_RxCpltCallback (I2S_HandleTypeDef * hi2s) {
+	moveIn(blockSize * 4);
+}
+
 HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data) {
 	uint8_t devAddr = 0x30;
 	HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 10);
 	return status;
 }
 
+uint8_t readCodec(uint8_t addr) {
+	uint8_t devAddr = 0x30;
+	uint8_t data = 0;
+	HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 10);
+	return data;
+}
+
 extern void CppMain_setup();
+
+
+#define WS_Pin GPIO_PIN_15
+#define WS_Pin_Port GPIOA
 
 /* USER CODE END 0 */
 
@@ -189,9 +260,27 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
+
+  /*
+  // SET WS HIGH
+  {
+	  GPIO_InitTypeDef GPIO_InitStruct = {0};
+	  GPIO_InitStruct.Pin = WS_Pin;
+	  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	  GPIO_InitStruct.Pull = GPIO_NOPULL;
+	  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+	  HAL_GPIO_WritePin(GPIOA, WS_Pin, GPIO_PIN_SET);
+  }
+	*/
+  // MOVING THIS PER ERRATA
+  MX_I2S3_Init();
+
   MX_I2S2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+
+  HAL_GPIO_WritePin(GPIOA, WS_Pin, GPIO_PIN_SET);
 
 	HAL_StatusTypeDef status;
 	uint8_t devAddr = 0x60 << 1;
@@ -207,7 +296,6 @@ int main(void)
 	CppMain_setup();
 
 	// ----- CODEC INIT ---------------------------------------------------
-
 	// Harware reset the CODEC
 	HAL_GPIO_WritePin(CODEC_RESET_GPIO_Port, CODEC_RESET_Pin, 1);
 	HAL_GPIO_WritePin(CODEC_RESET_GPIO_Port, CODEC_RESET_Pin, 0);
@@ -245,21 +333,22 @@ int main(void)
 	data = 0;
   	status = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 100);
   	if (data != 10)
-  		printf("Problem");
+  		printf("Problem\r\n");
   	// Set GPIO to LO
 	HAL_GPIO_WritePin(CODEC_MFP5_GPIO_Port, CODEC_MFP5_Pin, 0);
 	// Read back
   	status = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 100);
   	if (data != 8)
-  		printf("Problem");
+  		printf("Problem\r\n");
 
   	// ===== DAC SETUP ======
 	// Select page 0
 	writeCodec(0x00, 0x00);
 	// Clock settings register 1, Configure source of CODEC_CLKIN=MCLK
 	writeCodec(0x04, 0b00000000);
-	// PLL is powered down
+	// PLL is powered down (not used)
 	writeCodec(0x05, 0b00000000);
+
 	// Setup NDAC (on, divide by 1)
 	writeCodec(0x0b, 0x81);
 	// Setup MDAC (on, divide by 2)
@@ -267,16 +356,27 @@ int main(void)
 	// Set OSR of DAC to 128
 	writeCodec(0x0d, 0x00);
 	writeCodec(0x0e, 0x80);
+
+	// Setup NADC (on, divide by 1) [Pg. 99]
+	writeCodec(0x12, 0x81);
+	// Setup MADC (on, divide by 2) [Pg. 99]
+	writeCodec(0x13, 0x82);
+	// Set OSR of ADC to 128
+	writeCodec(0x14, 0b10000000);
+
 	// Audio interface.  I2S mode, word length=32, BCLK is input, WCLK is input, DOUT not HI-Z
 	writeCodec(0x1b, 0b00110000);
-	// Data offset by 1 BCLK
-	// TODO: RESEARCH THIS TO MAKE SURE IT IS RIGHT
-	//writeCodec(0x1c, 0b00000001);
+	// Data offset by 0 BCLK (default)
+	writeCodec(0x1c, 0b00000000);
 	// Default bit clock polarity, BDIV_CLKIN=DAC_CLK
 	writeCodec(0x1d, 0b00000000);
 	// BCLK-N divider powered down
-	// TODO: CHECK THIS
 	writeCodec(0x1e, 0b00000000);
+	// Audio interface setting register 5 -
+	writeCodec(0x20, 0x00);
+	// DOUT/MFP2 Control [Pg. 108]
+	// TODO: WHAT IS BUS KEEPER?
+	writeCodec(0x35, 0b00010010);
 	// Setup DAC mode = PRB_P8, which is:
 	//   Interpolation filter B
 	//   Stereo
@@ -286,6 +386,9 @@ int main(void)
 	//   3D off
 	//   No beep generation
 	writeCodec(0x3c, 0b00001000);
+	// Setup ADC mode.  Use PRB_R1 (First-Order IIR, AGC, Filter A)
+	writeCodec(0x3d, 0b00000001);
+
 	// Select page 1
 	writeCodec(0x00, 0x01);
 	// Disable weak connection of AVdd with DVdd in presence of external AVdd supply
@@ -293,12 +396,16 @@ int main(void)
 	// DVdd/AVdd LDO nominally 1.72V, analog blocks enabled, Avdd LDO powered up
 	writeCodec(0x02, 0b00000001);
 	// Analog input quick-charging configuration  Input power-up time is 6.4ms (for ADC)
-	// TODO: NEED TO STUDY THIS
 	writeCodec(0x47, 0b00110010);
+	// Set MicPGA startup delay to 3.1ms
+	writeCodec(0x47, 0x32);
 	// Reference power-up configuration register.  Reference powers up in 40ms when
 	// analog blocks are on.
 	writeCodec(0x7b, 0b00000001);
-  	// Select page 1
+	// ADC Power Tune PTM_R4
+	writeCodec(0x3d, 0x00);
+
+	// Select page 1
 	writeCodec(0x00, 0x01);
 	// Soft routing 0, De-pop: 5 time constants, 6k resistance
 	writeCodec(0x14, 0b00100101);
@@ -314,8 +421,8 @@ int main(void)
 	writeCodec(0x04, 0x00);
 	// [VOLUME CONTROL]
   	// Unmute HPL/HPR driver, set 0dB gain
-	writeCodec(0x10, 0b00111011);
-	writeCodec(0x11, 0b00111011);
+	writeCodec(0x10, 0b00111010);
+	writeCodec(0x11, 0b00111010);
   	// Power configuration.  Output of HPL/HPR powered from LDOIN, range is 1.8V to 3.6V
 	writeCodec(0x0a, 0b00000011);
 	// Overcurrent detection on, debounced = 64ms, driver shut down
@@ -329,28 +436,51 @@ int main(void)
 	writeCodec(0x00, 0x00);
 	// [VOLUME CONTROL]
 	// Left DAC digital volume
-	writeCodec(0x41, 0b11110000);
+	writeCodec(0x41, 0b11111000);
 	// [VOLUME CONTROL]
 	// Right DAC digital volume
-	writeCodec(0x42, 0b11110000);
+	writeCodec(0x42, 0b11111000);
   	// Power LDAC/RDAC, soft-stepping disabled
 	writeCodec(0x3f, 0b11010110);
 	// Unmute
 	writeCodec(0x40, 0b00000000);
 
-	// Read back status
-  	// Select page 0
-	writeCodec(0x00, 0x00);
-	addr = 0x25;
-  	status = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 100);
-  	if (status != 0b10101010) {
-  		printf("Problem");
-  	}
+	// Configure ADC [Pg. 90 for example]
+  	// Select page 1
+	writeCodec(0x00, 0x01);
+	// Route IN1L to left Mic PGA with 20K input impedance [Pg. 135]
+	writeCodec(0x34, 0x80);
+	// Route Common Mode to LEFT_M with impedance of 20K
+	writeCodec(0x36, 0x80);
+	// Route IN1R to right Mic PGA with input impedance of 20K [Pg. 135]
+	writeCodec(0x37, 0x80);
+	// Route Common Mode to RIGHT_M with impedance of 20K
+	writeCodec(0x39, 0x80);
 
-  	// Select page 0
+	// Unmute left MICPGA, set gain to 6dB (given that input impedance is 20k => 0dB)
+	writeCodec(0x3b, 0x0c);
+	// Unmute right MICPGA, set gain to 6dB (given that input impedance is 20k => 0dB)
+	writeCodec(0x3c, 0x0c);
+
+	// Page 0
 	writeCodec(0x00, 0x00);
-	addr = 0x2c;
-  	status = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 100);
+	// Power up left and right ADC channels, digital mic off, 1 gain step per ADC clock [Pg. 115]
+	writeCodec(0x51, 0b11000000);
+	// Unmute left and right digital volume controls.  ADC fine gain adjust = 0dB [Pg. 115]
+	writeCodec(0x52, 0b00000000);
+
+	// ADC channel volume control - left (should be 0dB) [Pg. 116]
+	writeCodec(0x53, 0b00100110);
+	// ADC channel volume control - right (should be 0dB)
+	writeCodec(0x54, 0b00100110);
+
+	// *******************************************
+	// TEMPORARY: Turn on loopback.  This routes ADC output to DAC input. [Pg. 101]
+	//writeCodec(0x00, 0x00);
+	//data = readCodec(0x1d);
+	//data |= 0b00010000;
+	//writeCodec(0x1d, data);
+	// *******************************************
 
 	// Populate synthesizer LUT
 	for (int i = 0; i < lut_size; i++) {
@@ -359,9 +489,10 @@ int main(void)
 		lut[i] = cos(a);
 	}
 
-	setSynthFreq(4000);
+	setSynthFreq(2000);
 
     // Initialize DMA
+    HAL_I2S_Receive_DMA(&hi2s3, in_data, blockSize * 4);
     HAL_I2S_Transmit_DMA(&hi2s2, out_data, blockSize * 4);
 
   /* USER CODE END 2 */
@@ -420,7 +551,7 @@ void SystemClock_Config(void)
     Error_Handler();
   }
   PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
-  PeriphClkInitStruct.PLLI2S.PLLI2SN = 96;
+  PeriphClkInitStruct.PLLI2S.PLLI2SN = 72;
   PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
@@ -497,6 +628,40 @@ static void MX_I2S2_Init(void)
 }
 
 /**
+  * @brief I2S3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2S3_Init(void)
+{
+
+  /* USER CODE BEGIN I2S3_Init 0 */
+
+  /* USER CODE END I2S3_Init 0 */
+
+  /* USER CODE BEGIN I2S3_Init 1 */
+
+  /* USER CODE END I2S3_Init 1 */
+  hi2s3.Instance = SPI3;
+  hi2s3.Init.Mode = I2S_MODE_SLAVE_RX;
+  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat = I2S_DATAFORMAT_32B;
+  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
+  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_44K;
+  hi2s3.Init.CPOL = I2S_CPOL_LOW;
+  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2S3_Init 2 */
+
+  /* USER CODE END I2S3_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -539,6 +704,9 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);

@@ -6,6 +6,10 @@
 extern "C" {
 	I2C_HandleTypeDef hi2c1;
 	UART_HandleTypeDef huart1;
+
+	HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data);
+	uint8_t readCodec(uint8_t addr);
+
 }
 
 static STM32_HAL_Interface i2c_interface(&hi2c1);
@@ -17,15 +21,47 @@ static SerialDriver sd1(&huart1);
 class TestHandler : public MessageHandler {
 public:
 	void onMessage(const char* m) {
-		char msg[128];
-		sprintf(msg, "Got: [%s]\r\n", m);
-		sd1.send(msg);
+		sd1.send("RX[");
+		sd1.send(m);
+		sd1.send("]\r\n");
+
+		// Commands
+		if (m[0] == 'a') {
+			char vl = readCodec(0x41);
+			char vr = readCodec(0x42);
+			char msg[32];
+			sprintf(msg,"Volume: %d\n",(int)vl);
+			sd1.send(msg);
+			vl += 2;
+			vr += 2;
+			writeCodec(0x41, vl);
+			writeCodec(0x42, vr);
+		}
+		else if (m[0] == 'z') {
+			char vl = readCodec(0x41);
+			char vr = readCodec(0x42);
+			char msg[32];
+			sprintf(msg,"Volume: %d\n",(int)vl);
+			sd1.send(msg);
+			vl -= 2;
+			vr -= 2;
+			writeCodec(0x41, vl);
+			writeCodec(0x42, vr);
+		}
+
 	}
 };
 
 TestHandler handler;
 
 extern "C" {
+
+	// NEEDED FOR SERIAL WIRE DEBUG
+	int _write(int file, char* ptr, int len) {
+		for (int i = 0; i < len; i++)
+			sd1.sendChar((*ptr++));
+		return len;
+	}
 
 	// This function is called by the HAL
 	void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
