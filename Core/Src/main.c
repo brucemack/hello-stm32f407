@@ -173,8 +173,8 @@ static void moveIn(int base) {
 
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
-		//lutPtr = (lutPtr + lutStep) & 0xff;
-		//int32_t sample = amp * lut[lutPtr] * gain;
+		lutPtr = (lutPtr + lutStep) & 0xff;
+		int32_t sample = amp * lut[lutPtr] * gain;
 
 		// Queue the sample for processing
 		queue[queue_write_ptr++] = sample;
@@ -222,6 +222,33 @@ uint8_t readCodec(uint8_t addr) {
 	return data;
 }
 
+
+uint8_t encodeG0(int16_t gain) {
+	return gain & 0b00111111;
+}
+
+int16_t decodeG0(uint8_t g) {
+	int16_t r = g;
+	// Sign extension
+	if (r & 0b00100000) {
+		r |= 0b1111111111000000;
+	}
+	return r;
+}
+
+uint8_t encodeG1(int16_t gain) {
+	return gain & 0b11111111;
+}
+
+int16_t decodeG1(uint8_t g) {
+	int16_t r = g;
+	// Sign extension
+	if (r & 0b10000000) {
+		r |= 0b1111111110000000;
+	}
+	return r;
+}
+
 extern void CppMain_setup();
 
 
@@ -260,27 +287,10 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
-
-  /*
-  // SET WS HIGH
-  {
-	  GPIO_InitTypeDef GPIO_InitStruct = {0};
-	  GPIO_InitStruct.Pin = WS_Pin;
-	  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	  GPIO_InitStruct.Pull = GPIO_NOPULL;
-	  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-	  HAL_GPIO_WritePin(GPIOA, WS_Pin, GPIO_PIN_SET);
-  }
-	*/
-  // MOVING THIS PER ERRATA
-  MX_I2S3_Init();
-
   MX_I2S2_Init();
+  MX_I2S3_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
-  HAL_GPIO_WritePin(GPIOA, WS_Pin, GPIO_PIN_SET);
 
 	HAL_StatusTypeDef status;
 	uint8_t devAddr = 0x60 << 1;
@@ -375,7 +385,6 @@ int main(void)
 	// Audio interface setting register 5 -
 	writeCodec(0x20, 0x00);
 	// DOUT/MFP2 Control [Pg. 108]
-	// TODO: WHAT IS BUS KEEPER?
 	writeCodec(0x35, 0b00010010);
 	// Setup DAC mode = PRB_P8, which is:
 	//   Interpolation filter B
@@ -412,15 +421,13 @@ int main(void)
 	// Route LDAC/RDAC to HPL/HPR
 	writeCodec(0x0c, 0b00001000);
 	writeCodec(0x0d, 0b00001000);
-	// Route IN1L to HPL (BYPASS)
-	//writeCodec(0x0c, 0b00000100);
-	// Route IN1R to HPR (BYPASS)
-	//writeCodec(0x0d, 0b00000100);
 	// Set the DAC PTM mode to PTM_P3/P4
 	writeCodec(0x03, 0x00);
 	writeCodec(0x04, 0x00);
-	// [VOLUME CONTROL]
-  	// Unmute HPL/HPR driver, set 0dB gain
+  	// Unmute HPL/HPR driver (0b01), set 0dB gain
+	// Here is a level control that is not supposed to be used as
+	// the regular volume control.
+	// Range: 0b111010 -> 0b011101
 	writeCodec(0x10, 0b00111010);
 	writeCodec(0x11, 0b00111010);
   	// Power configuration.  Output of HPL/HPR powered from LDOIN, range is 1.8V to 3.6V
@@ -436,10 +443,10 @@ int main(void)
 	writeCodec(0x00, 0x00);
 	// [VOLUME CONTROL]
 	// Left DAC digital volume
-	writeCodec(0x41, 0b11111000);
+	writeCodec(0x41, encodeG1(-5));
 	// [VOLUME CONTROL]
 	// Right DAC digital volume
-	writeCodec(0x42, 0b11111000);
+	writeCodec(0x42, encodeG1(-5));
   	// Power LDAC/RDAC, soft-stepping disabled
 	writeCodec(0x3f, 0b11010110);
 	// Unmute
@@ -492,7 +499,11 @@ int main(void)
 	setSynthFreq(2000);
 
     // Initialize DMA
+	// IPORTANT: Because of a bug in STM32F407, we must always enable the
+	// slave I2S port before the master.
+	HAL_GPIO_WritePin(GPIOA, WS_Pin, GPIO_PIN_SET);
     HAL_I2S_Receive_DMA(&hi2s3, in_data, blockSize * 4);
+    // This is the master:
     HAL_I2S_Transmit_DMA(&hi2s2, out_data, blockSize * 4);
 
   /* USER CODE END 2 */

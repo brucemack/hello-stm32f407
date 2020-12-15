@@ -10,6 +10,10 @@ extern "C" {
 	HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data);
 	uint8_t readCodec(uint8_t addr);
 
+	uint8_t encodeG0(int16_t gain);
+	int16_t decodeG0(uint8_t g);
+	uint8_t encodeG1(int16_t gain);
+	int16_t decodeG1(uint8_t g);
 }
 
 static STM32_HAL_Interface i2c_interface(&hi2c1);
@@ -27,26 +31,60 @@ public:
 
 		// Commands
 		if (m[0] == 'a') {
-			char vl = readCodec(0x41);
-			char vr = readCodec(0x42);
+			// Page 0
+			writeCodec(0x00, 0x00);
+			//HAL_Delay(5);
+			int vl = decodeG1(readCodec(0x41));
+			//HAL_Delay(5);
 			char msg[32];
-			sprintf(msg,"Volume: %d\n",(int)vl);
+			sprintf(msg,"DAC Volume: %d\r\n",vl);
 			sd1.send(msg);
-			vl += 2;
-			vr += 2;
-			writeCodec(0x41, vl);
-			writeCodec(0x42, vr);
+			if (vl < 48)
+				vl += 1;
+			writeCodec(0x41, encodeG1(vl));
+			//HAL_Delay(5);
+			writeCodec(0x42, encodeG1(vl));
+			//HAL_Delay(5);
 		}
 		else if (m[0] == 'z') {
-			char vl = readCodec(0x41);
-			char vr = readCodec(0x42);
+			// Page 0
+			writeCodec(0x00, 0x00);
+			//HAL_Delay(5);
+			int vl = decodeG1(readCodec(0x41));
+			//HAL_Delay(5);
 			char msg[32];
-			sprintf(msg,"Volume: %d\n",(int)vl);
+			sprintf(msg,"DAC Volume: %d\r\n",vl);
 			sd1.send(msg);
-			vl -= 2;
-			vr -= 2;
-			writeCodec(0x41, vl);
-			writeCodec(0x42, vr);
+			if (vl > -127)
+				vl -= 1;
+			writeCodec(0x41, encodeG1(vl));
+			//HAL_Delay(5);
+			writeCodec(0x42, encodeG1(vl));
+			//HAL_Delay(5);
+		}
+		else if (m[0] == 's') {
+			// Page 1
+			writeCodec(0x00, 0x01);
+			int vl = decodeG0(readCodec(0x10) & 0b00111111);
+			char msg[32];
+			sprintf(msg,"G0: %d\r\n",vl);
+			sd1.send(msg);
+			if (vl < 29)
+				vl += 1;
+			writeCodec(0x10,encodeG0(vl));
+			writeCodec(0x11,encodeG0(vl));
+		}
+		else if (m[0] == 'x') {
+			// Page 1
+			writeCodec(0x00, 0x01);
+			int vl = decodeG0(readCodec(0x10) & 0b00111111);
+			char msg[32];
+			sprintf(msg,"G0: %d\r\n",vl);
+			sd1.send(msg);
+			if (vl > -6)
+				vl += -1;
+			writeCodec(0x10,encodeG0(vl));
+			writeCodec(0x11,encodeG0(vl));
 		}
 
 	}
