@@ -164,7 +164,6 @@ static void moveIn(int base, int outBlockFree) {
 
 	for (int i = 0; i < blockSize; i++) {
 
-		/*
 		// Read the left channel into the receive queue.
 		// Load the high end of the sample into the high end of the 32-bit number
 		uint16_t s = in_data[in_ptr++];
@@ -174,12 +173,11 @@ static void moveIn(int base, int outBlockFree) {
 		// Add low end of sample
 		s = in_data[in_ptr++];
 		sample |= s;
-		*/
 
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
-		lutPtr = (lutPtr + lutStep) & 0xff;
-		sample = amp * lut[lutPtr] * gain;
+		//lutPtr = (lutPtr + lutStep) & 0xff;
+		//sample = amp * lut[lutPtr] * gain;
 
 		/*
 		// Queue the sample for processing
