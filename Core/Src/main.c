@@ -95,19 +95,17 @@ static const int blockSize = FILTER_BLOCK_SIZE;
 static volatile uint16_t out_data[FILTER_BLOCK_SIZE * 8];
 static volatile uint16_t in_data[FILTER_BLOCK_SIZE * 8];
 
-// A circular data transfer queue loaded from the input DMA interrupt and read from
-// the output DMA interrupt.  This queue contains signed and properly scaled values.
-static const int queueSize = FILTER_BLOCK_SIZE * 2 + 1;
-static volatile int32_t queue[FILTER_BLOCK_SIZE * 2 + 1];
-// Pointers for the queue
-static volatile int queue_write_ptr = 0;
-static volatile int queue_read_ptr = 0;
+// This keeps track of which output block is currently not being
+// transferred to the I2S interface.  Buffer filling should happen
+// on this block.
+static volatile int outBlockFree = 0;
 
 static void setSynthFreq(float freqHz) {
 	float phasePerSample = (freqHz / fs) * 2.0 * 3.14159;
 	lutStep = (phasePerSample / (2.0 * 3.1415926)) * lut_size;
 }
 
+/*
 static void moveOut(int base) {
 
 	int32_t ci;
@@ -148,19 +146,25 @@ static void moveOut(int base) {
 		out_data[out_ptr++] = 0;
 	}
 }
-
-int ramp = 0;
+*/
 
 // This read half of the inbound data from the DMA buffer.  This is
 // called by the DMA interrupt at the half-way point through the
 // entire DMA buffer.
-static void moveIn(int base) {
+static void moveIn(int base, int outBlockFree) {
 
 	int in_ptr = base;
+	int out_ptr;
+	if (outBlockFree == 0) {
+		out_ptr = 0;
+	} else {
+		out_ptr = blockSize * 4;
+	}
 	int32_t sample;
 
 	for (int i = 0; i < blockSize; i++) {
 
+		/*
 		// Read the left channel into the receive queue.
 		// Load the high end of the sample into the high end of the 32-bit number
 		uint16_t s = in_data[in_ptr++];
@@ -170,43 +174,57 @@ static void moveIn(int base) {
 		// Add low end of sample
 		s = in_data[in_ptr++];
 		sample |= s;
+		*/
 
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
 		lutPtr = (lutPtr + lutStep) & 0xff;
-		int32_t sample = amp * lut[lutPtr] * gain;
+		sample = amp * lut[lutPtr] * gain;
 
+		/*
 		// Queue the sample for processing
 		queue[queue_write_ptr++] = sample;
 		// Look for the wrap
 		if (queue_write_ptr == queueSize) {
 			queue_write_ptr = 0;
 		}
+		*/
+
+		uint16_t hi = (sample >> 16) & 0xffff;
+		uint16_t lo = (sample & 0xffff);
+		out_data[out_ptr++] = hi;
+		out_data[out_ptr++] = lo;
 
 		// Ignore the right channel input
 		in_ptr++;
 		in_ptr++;
+
+		// Ignore the right channel output
+		out_data[out_ptr++] = 0;
+		out_data[out_ptr++] = 0;
 	}
 }
 
-// Called at the half-way point.  Fills in the first half of the DMA area.
+// Called at the half-way point.  First half of the DMA area is available
+// for updating after this call.
 void HAL_I2S_TxHalfCpltCallback (I2S_HandleTypeDef * hi2s) {
-	moveOut(0);
+	outBlockFree = 0;
 }
 
-// Called at the end point.  Fills in the second half of the DMA area.
+// Called at the end point.  Second half of the DMA area if available
+// for updating after this call
 void HAL_I2S_TxCpltCallback (I2S_HandleTypeDef * hi2s) {
-	moveOut(blockSize * 4);
+	outBlockFree = 1;
 }
 
 // Called at the half-way point.  Fills in the first half of the DMA area.
 void HAL_I2S_RxHalfCpltCallback (I2S_HandleTypeDef * hi2s) {
-	moveIn(0);
+	moveIn(0, outBlockFree);
 }
 
 // Called at the end point.  Fills in the second half of the DMA area.
 void HAL_I2S_RxCpltCallback (I2S_HandleTypeDef * hi2s) {
-	moveIn(blockSize * 4);
+	moveIn(blockSize * 4, outBlockFree);
 }
 
 HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data) {
@@ -288,8 +306,8 @@ int main(void)
   MX_DMA_Init();
   MX_I2C1_Init();
   MX_I2S2_Init();
-  MX_I2S3_Init();
   MX_USART1_UART_Init();
+  MX_I2S3_Init();
   /* USER CODE BEGIN 2 */
 
 	HAL_StatusTypeDef status;
