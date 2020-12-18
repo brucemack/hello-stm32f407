@@ -22,6 +22,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <math.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#define ARM_MATH_CM4
+#include "arm_math.h"
 
 /* USER CODE END Includes */
 
@@ -83,8 +89,14 @@ static unsigned int lutPtr = 0;
 static float balance = 1.0;
 static float gain = 0.75;
 
-#define FILTER_BLOCK_SIZE 16
+#define FILTER_TAP_NUM 63
+// This is the number of samples that we process in each DMA cycle
+#define FILTER_BLOCK_SIZE 64
 static const int blockSize = FILTER_BLOCK_SIZE;
+
+extern float hilbert_90_filter_taps[FILTER_TAP_NUM];
+static float filter_state[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
+static arm_fir_instance_f32 filter_lp_0;
 
 // This where the DMA happens.  We multiply by 8 to address:
 // - The fact that we have left and right data moving through at the same time
@@ -95,7 +107,7 @@ static const int blockSize = FILTER_BLOCK_SIZE;
 static volatile uint16_t out_data[FILTER_BLOCK_SIZE * 8];
 static volatile uint16_t in_data[FILTER_BLOCK_SIZE * 8];
 
-// This keeps track of which output block is currently not being
+// This keeps track of which output block is currently *not* being
 // transferred to the I2S interface.  Buffer filling should happen
 // on this block.
 static volatile int outBlockFree = 0;
@@ -105,62 +117,30 @@ static void setSynthFreq(float freqHz) {
 	lutStep = (phasePerSample / (2.0 * 3.1415926)) * lut_size;
 }
 
-/*
-static void moveOut(int base) {
-
-	int32_t ci;
-	uint16_t hi = 0;
-	uint16_t lo = 0;
-
-	int out_ptr = base;
-	float filterOut[FILTER_BLOCK_SIZE];
-
-	// Take the synthesized cosine and load it into the filter input area
-	for (int i = 0; i < blockSize; i++) {
-
-		// Generate synthesized data by stepping through the cosine table
-		// This handles the wrapping of the LUT pointer:
-		//lutPtr = (lutPtr + lutStep) & 0xff;
-		//filterOut[i] = amp * lut[lutPtr] * gain;
-
-		// Move the sampled data into the arrays that will be processed by
-		// the DSP functions.  This is a case from a signed integer to
-		// a float32.
-		filterOut[i] = queue[queue_read_ptr++];
-		// Look for the wrap
-		if (queue_read_ptr == queueSize) {
-			queue_read_ptr = 0;
-		}
-	}
-
-	// Generate the output signals
-	for (int i = 0; i < blockSize; i++) {
-		// LEFT CHANNEL
-		ci = filterOut[i] * balance;
-		hi = (ci >> 16) & 0xffff;
-		lo = ci & 0xffff;
-		out_data[out_ptr++] = hi;
-		out_data[out_ptr++] = lo;
-		// RIGHT CHANNEL
-		out_data[out_ptr++] = 0;
-		out_data[out_ptr++] = 0;
-	}
-}
-*/
-
-// This read half of the inbound data from the DMA buffer.  This is
+// This reads half of the inbound data from the DMA buffer.  This is
 // called by the DMA interrupt at the half-way point through the
 // entire DMA buffer.
-static void moveIn(int base, int outBlockFree) {
+static void moveIn(int inBlock, int outBlockFree) {
 
-	int in_ptr = base;
+	int in_ptr;
+	if (inBlock == 0) {
+		in_ptr = 0;
+	} else {
+		in_ptr = blockSize * 4;
+	}
+
 	int out_ptr;
 	if (outBlockFree == 0) {
 		out_ptr = 0;
 	} else {
 		out_ptr = blockSize * 4;
 	}
+
 	int32_t sample;
+	uint16_t hi;
+	uint16_t lo;
+	float32_t filterIn[FILTER_BLOCK_SIZE];
+	float32_t filterOut[FILTER_BLOCK_SIZE];
 
 	for (int i = 0; i < blockSize; i++) {
 
@@ -174,32 +154,37 @@ static void moveIn(int base, int outBlockFree) {
 		s = in_data[in_ptr++];
 		sample |= s;
 
+		filterIn[i] = sample;
+
+		// Ignore the right channel input
+		in_ptr++;
+		in_ptr++;
+	}
+
+	// Apply the FIR filter
+	// MEASUREMENT: This takes about 4,000 cycles.
+	arm_fir_f32(&filter_lp_0, filterIn, filterOut, blockSize);
+
+	for (int i = 0; i < blockSize; i++) {
+
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
 		//lutPtr = (lutPtr + lutStep) & 0xff;
 		//sample = amp * lut[lutPtr] * gain;
 
-		/*
-		// Queue the sample for processing
-		queue[queue_write_ptr++] = sample;
-		// Look for the wrap
-		if (queue_write_ptr == queueSize) {
-			queue_write_ptr = 0;
-		}
-		*/
-
-		uint16_t hi = (sample >> 16) & 0xffff;
-		uint16_t lo = (sample & 0xffff);
+		// Transfer filtered sample to left output
+		sample = filterOut[i];
+		hi = (sample >> 16) & 0xffff;
+		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 
-		// Ignore the right channel input
-		in_ptr++;
-		in_ptr++;
-
-		// Ignore the right channel output
-		out_data[out_ptr++] = 0;
-		out_data[out_ptr++] = 0;
+		// Raw data to right output
+		sample = filterIn[i];
+		hi = (sample >> 16) & 0xffff;
+		lo = (sample & 0xffff);
+		out_data[out_ptr++] = hi;
+		out_data[out_ptr++] = lo;
 	}
 }
 
@@ -222,7 +207,7 @@ void HAL_I2S_RxHalfCpltCallback (I2S_HandleTypeDef * hi2s) {
 
 // Called at the end point.  Fills in the second half of the DMA area.
 void HAL_I2S_RxCpltCallback (I2S_HandleTypeDef * hi2s) {
-	moveIn(blockSize * 4, outBlockFree);
+	moveIn(1, outBlockFree);
 }
 
 HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data) {
@@ -308,6 +293,9 @@ int main(void)
   MX_I2S3_Init();
   /* USER CODE BEGIN 2 */
 
+	// Initialize the filter
+	arm_fir_init_f32(&filter_lp_0, FILTER_TAP_NUM, hilbert_90_filter_taps, filter_state, FILTER_BLOCK_SIZE);
+
 	HAL_StatusTypeDef status;
 	uint8_t devAddr = 0x60 << 1;
 	uint8_t addr = 0;
@@ -317,7 +305,7 @@ int main(void)
 	// Make sure the device is alive
 	status = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(devAddr), 2, 2);
 	if (status != HAL_OK) // HAL_ERROR or HAL_BUSY or HAL_TIMEOUT
-		printf("Problem with Si5351");
+		printf("Problem with Si5351\r\n");
 
 	CppMain_setup();
 
@@ -337,7 +325,7 @@ int main(void)
 	// Make sure the device is alive
 	status = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(devAddr), 2, 2);
 	if (status != HAL_OK) // HAL_ERROR or HAL_BUSY or HAL_TIMEOUT
-		printf("Problem");
+		printf("Problem with CODEC\r\n");
 
 	// Select page 0
 	writeCodec(0, 0);
