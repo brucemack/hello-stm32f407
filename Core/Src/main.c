@@ -91,12 +91,35 @@ static float gain = 0.75;
 
 #define FILTER_TAP_NUM 63
 // This is the number of samples that we process in each DMA cycle
-#define FILTER_BLOCK_SIZE 64
+#define FILTER_BLOCK_SIZE 16
 static const int blockSize = FILTER_BLOCK_SIZE;
 
 extern float hilbert_90_filter_taps[FILTER_TAP_NUM];
 static float filter_state[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
 static arm_fir_instance_f32 filter_lp_0;
+
+// Delay line that is equivalent in length to the group delay of the filter
+#define DELAY_TAP_NUM 63
+static float delayBuffer[(DELAY_TAP_NUM - 1) / 2];
+static int delaySize = (DELAY_TAP_NUM - 1) / 2;
+static int delayPtr = 0;
+
+static int fix(int ptr) {
+	return ptr % delaySize;
+}
+
+static void writeDelay(const float* d, int size) {
+	for (int i = 0; i < size; i++) {
+		delayBuffer[delayPtr] = d[i];
+		delayPtr = fix(delayPtr + 1);
+	}
+}
+
+static void readDelay(float* d, int size) {
+	for (int i = 0; i < size; i++) {
+		d[i] = delayBuffer[fix(delayPtr + i)];
+	}
+}
 
 // This where the DMA happens.  We multiply by 8 to address:
 // - The fact that we have left and right data moving through at the same time
@@ -139,8 +162,9 @@ static void moveIn(int inBlock, int outBlockFree) {
 	int32_t sample;
 	uint16_t hi;
 	uint16_t lo;
-	float32_t filterIn[FILTER_BLOCK_SIZE];
-	float32_t filterOut[FILTER_BLOCK_SIZE];
+	float filterIn[FILTER_BLOCK_SIZE];
+	float filterOut[FILTER_BLOCK_SIZE];
+	float delayOut[FILTER_BLOCK_SIZE];
 
 	for (int i = 0; i < blockSize; i++) {
 
@@ -164,9 +188,13 @@ static void moveIn(int inBlock, int outBlockFree) {
 	// Apply the FIR filter
 	// MEASUREMENT: This takes about 4,000 cycles.
 	arm_fir_f32(&filter_lp_0, filterIn, filterOut, blockSize);
+	// Move data out of the circular buffer (lagged)
+	readDelay(delayOut, blockSize);
+	// Move data into the circular buffer
+	writeDelay(filterIn, blockSize);
 
+	// Move things into the DMA outbound area
 	for (int i = 0; i < blockSize; i++) {
-
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
 		//lutPtr = (lutPtr + lutStep) & 0xff;
@@ -179,8 +207,8 @@ static void moveIn(int inBlock, int outBlockFree) {
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 
-		// Raw data to right output
-		sample = filterIn[i];
+		// Transfer delayed data to right output
+		sample = delayOut[i];
 		hi = (sample >> 16) & 0xffff;
 		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
