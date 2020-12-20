@@ -98,31 +98,13 @@ volatile float phaseAdjust = -0.08;
 static const int blockSize = FILTER_BLOCK_SIZE;
 
 extern float hilbert_90_filter_taps[FILTER_TAP_NUM];
-static float filter_state[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
-static arm_fir_instance_f32 filter_lp_0;
+extern float hilbert_0_filter_taps[FILTER_TAP_NUM];
 
-// Delay line that is equivalent in length to the group delay of the filter
-#define DELAY_TAP_NUM 63
-static float delayBuffer[(DELAY_TAP_NUM - 1) / 2];
-static int delaySize = (DELAY_TAP_NUM - 1) / 2;
-static int delayPtr = 0;
+static float filter_state_90[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
+static float filter_state_0[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
 
-static int fix(int ptr) {
-	return ptr % delaySize;
-}
-
-static void writeDelay(const float* d, int size) {
-	for (int i = 0; i < size; i++) {
-		delayBuffer[delayPtr] = d[i];
-		delayPtr = fix(delayPtr + 1);
-	}
-}
-
-static void readDelay(float* d, int size) {
-	for (int i = 0; i < size; i++) {
-		d[i] = delayBuffer[fix(delayPtr + i)];
-	}
-}
+static arm_fir_instance_f32 filter_hilbert_90;
+static arm_fir_instance_f32 filter_hilbert_0;
 
 // This where the DMA happens.  We multiply by 8 to address:
 // - The fact that we have left and right data moving through at the same time
@@ -165,10 +147,10 @@ static void moveIn(int inBlock, int outBlockFree) {
 	int32_t sampleI, sampleQ;
 	uint16_t hi;
 	uint16_t lo;
-	float filterIn[FILTER_BLOCK_SIZE];
-	float filterOut[FILTER_BLOCK_SIZE];
-	float delayIn[FILTER_BLOCK_SIZE];
-	float delayOut[FILTER_BLOCK_SIZE];
+	float filterIn90[FILTER_BLOCK_SIZE];
+	float filterOut90[FILTER_BLOCK_SIZE];
+	float filterIn0[FILTER_BLOCK_SIZE];
+	float filterOut0[FILTER_BLOCK_SIZE];
 	uint16_t s;
 
 	for (int i = 0; i < blockSize; i++) {
@@ -194,18 +176,19 @@ static void moveIn(int inBlock, int outBlockFree) {
 		sampleQ |= s;
 
 		// Allow a small amount of the Q signal into the I for phase adjust
-		filterIn[i] = (float)sampleI + (float)sampleQ * phaseAdjust;
-		delayIn[i] = (float)sampleQ + (float)sampleI * phaseAdjust;
+		filterIn90[i] = (float)sampleI + (float)sampleQ * phaseAdjust;
+		filterIn0[i] = (float)sampleQ + (float)sampleI * phaseAdjust;
 	}
 
 	// Apply the FIR filter
 	// MEASUREMENT: This takes about 4,000 cycles.
-	arm_fir_f32(&filter_lp_0, filterIn, filterOut, blockSize);
+	arm_fir_f32(&filter_hilbert_90, filterIn90, filterOut90, blockSize);
+	arm_fir_f32(&filter_hilbert_0, filterIn0, filterOut0, blockSize);
 
 	// Move data out of the circular buffer (lagged)
-	readDelay(delayOut, blockSize);
+	//readDelay(delayOut, blockSize);
 	// Move data into the circular buffer
-	writeDelay(delayIn, blockSize);
+	//writeDelay(delayIn, blockSize);
 
 	// Move things into the DMA outbound area
 	for (int i = 0; i < blockSize; i++) {
@@ -217,7 +200,7 @@ static void moveIn(int inBlock, int outBlockFree) {
 
 		// Combine Hilbert with Delay
 		// This looks like +USB (LSB is canceled)
-		int32_t sample = (0.5 * balance * filterOut[i]) - (0.5 * delayOut[i]);
+		int32_t sample = (0.5 * balance * filterOut90[i]) - (0.5 * filterOut0[i]);
 
 		// Transfer filtered sample to left output
 		//sample = filterOut[i];
@@ -316,7 +299,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
 	// Initialize the filter
-	arm_fir_init_f32(&filter_lp_0, FILTER_TAP_NUM, hilbert_90_filter_taps, filter_state, FILTER_BLOCK_SIZE);
+	arm_fir_init_f32(&filter_hilbert_90, FILTER_TAP_NUM, hilbert_90_filter_taps, filter_state_90, FILTER_BLOCK_SIZE);
+	arm_fir_init_f32(&filter_hilbert_0, FILTER_TAP_NUM, hilbert_0_filter_taps, filter_state_0, FILTER_BLOCK_SIZE);
 
 	HAL_StatusTypeDef status;
 	uint8_t devAddr = 0x60 << 1;
