@@ -86,7 +86,7 @@ static unsigned int lutStep = 0;
 // Current pointer in the LUT
 static unsigned int lutPtr = 0;
 // Balance between I/Q
-static float balance = 1.0;
+volatile float balance = 1.0;
 static float gain = 0.75;
 
 #define FILTER_TAP_NUM 63
@@ -164,51 +164,64 @@ static void moveIn(int inBlock, int outBlockFree) {
 	uint16_t lo;
 	float filterIn[FILTER_BLOCK_SIZE];
 	float filterOut[FILTER_BLOCK_SIZE];
+	float delayIn[FILTER_BLOCK_SIZE];
 	float delayOut[FILTER_BLOCK_SIZE];
+	uint16_t s;
 
 	for (int i = 0; i < blockSize; i++) {
 
-		// Read the left channel into the receive queue.
+		// Read the left channel into the filter
 		// Load the high end of the sample into the high end of the 32-bit number
-		uint16_t s = in_data[in_ptr++];
+		s = in_data[in_ptr++];
 		sample = s;
 		// Shift up
 		sample = sample << 16;
 		// Add low end of sample
 		s = in_data[in_ptr++];
 		sample |= s;
-
 		filterIn[i] = sample;
 
-		// Ignore the right channel input
-		in_ptr++;
-		in_ptr++;
+		// Read the right channel into the delay
+		// Load the high end of the sample into the high end of the 32-bit number
+		s = in_data[in_ptr++];
+		sample = s;
+		// Shift up
+		sample = sample << 16;
+		// Add low end of sample
+		s = in_data[in_ptr++];
+		sample |= s;
+		delayIn[i] = sample;
 	}
 
 	// Apply the FIR filter
 	// MEASUREMENT: This takes about 4,000 cycles.
 	arm_fir_f32(&filter_lp_0, filterIn, filterOut, blockSize);
+
 	// Move data out of the circular buffer (lagged)
 	readDelay(delayOut, blockSize);
 	// Move data into the circular buffer
-	writeDelay(filterIn, blockSize);
+	writeDelay(delayIn, blockSize);
 
 	// Move things into the DMA outbound area
 	for (int i = 0; i < blockSize; i++) {
+
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
 		//lutPtr = (lutPtr + lutStep) & 0xff;
 		//sample = amp * lut[lutPtr] * gain;
 
+		// Combine Hilbert with Delay
+		sample = (0.5 * balance * filterOut[i]) + (0.5 * delayOut[i]);
+
 		// Transfer filtered sample to left output
-		sample = filterOut[i];
+		//sample = filterOut[i];
 		hi = (sample >> 16) & 0xffff;
 		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 
 		// Transfer delayed data to right output
-		sample = delayOut[i];
+		//sample = delayOut[i];
 		hi = (sample >> 16) & 0xffff;
 		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
@@ -241,6 +254,9 @@ void HAL_I2S_RxCpltCallback (I2S_HandleTypeDef * hi2s) {
 HAL_StatusTypeDef writeCodec(uint8_t addr, uint8_t data) {
 	uint8_t devAddr = 0x30;
 	HAL_StatusTypeDef status = HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(devAddr), addr, 1, &data, 1, 10);
+	if (status != HAL_OK) {
+		printf("Error on I2C write\r\n");
+	}
 	return status;
 }
 
@@ -251,35 +267,7 @@ uint8_t readCodec(uint8_t addr) {
 	return data;
 }
 
-
-uint8_t encodeG0(int16_t gain) {
-	return gain & 0b00111111;
-}
-
-int16_t decodeG0(uint8_t g) {
-	int16_t r = g;
-	// Sign extension
-	if (r & 0b00100000) {
-		r |= 0b1111111111000000;
-	}
-	return r;
-}
-
-uint8_t encodeG1(int16_t gain) {
-	return gain & 0b11111111;
-}
-
-int16_t decodeG1(uint8_t g) {
-	int16_t r = g;
-	// Sign extension
-	if (r & 0b10000000) {
-		r |= 0b1111111110000000;
-	}
-	return r;
-}
-
 extern void CppMain_setup();
-
 
 #define WS_Pin GPIO_PIN_15
 #define WS_Pin_Port GPIOA
@@ -427,8 +415,8 @@ int main(void)
 	//   3D off
 	//   No beep generation
 	writeCodec(0x3c, 0b00001000);
-	// Setup ADC mode.  Use PRB_R1 (First-Order IIR, AGC, Filter A)
-	writeCodec(0x3d, 0b00000001);
+	// Setup ADC mode.  Use PRB_R2 (First-Order IIR, AGC, Filter A, 6 biquads)
+	writeCodec(0x3d, 0b00000010);
 
 	// Select page 1
 	writeCodec(0x00, 0x01);
@@ -475,10 +463,10 @@ int main(void)
 	writeCodec(0x00, 0x00);
 	// [VOLUME CONTROL]
 	// Left DAC digital volume
-	writeCodec(0x41, encodeG1(-5));
+	writeCodec(0x41, 0);
 	// [VOLUME CONTROL]
 	// Right DAC digital volume
-	writeCodec(0x42, encodeG1(-5));
+	writeCodec(0x42, 0);
   	// Power LDAC/RDAC, soft-stepping disabled
 	writeCodec(0x3f, 0b11010110);
 	// Unmute
@@ -778,7 +766,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOE, CODEC_MFP5_Pin|CODEC_RESET_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIO_0_GPIO_Port, GPIO_0_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, GPIO_0_Pin|GPIO_1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : CODEC_MFP5_Pin CODEC_RESET_Pin */
   GPIO_InitStruct.Pin = CODEC_MFP5_Pin|CODEC_RESET_Pin;
@@ -793,12 +781,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : GPIO_0_Pin */
-  GPIO_InitStruct.Pin = GPIO_0_Pin;
+  /*Configure GPIO pins : GPIO_0_Pin GPIO_1_Pin */
+  GPIO_InitStruct.Pin = GPIO_0_Pin|GPIO_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIO_0_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
 }
 
