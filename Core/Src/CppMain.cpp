@@ -16,6 +16,7 @@ extern "C" {
 	void __disable_irq();
 
 	extern float balance;
+	extern float phaseAdjust;
 }
 
 int8_t getHPLGain();
@@ -53,7 +54,9 @@ enum Command {
 	VFO_DOWN1000,
 	VFO_SET,
 	BALANCE_UP,
-	BALANCE_DOWN
+	BALANCE_DOWN,
+	PHASE_UP,
+	PHASE_DOWN
 };
 
 static STM32_HAL_Interface i2c_interface(&hi2c1);
@@ -83,6 +86,7 @@ void showStatus() {
 		(int)getADCLVolume(),
 		(int)getADCRVolume());
 	printf("  Balance (x100): %d\r\n", (int)(balance * 100.0));
+	printf("  Phase (x100): %d\r\n", (int)(phaseAdjust * 100.0));
 
 	// Sticky flags 1
 	writeCodec(0x00, 0x00);
@@ -185,6 +189,12 @@ public:
 		}
 		else if (m[0] == 'n') {
 			pendingCommand = Command::BALANCE_DOWN;
+		}
+		else if (m[0] == 'j') {
+			pendingCommand = Command::PHASE_UP;
+		}
+		else if (m[0] == 'm') {
+			pendingCommand = Command::PHASE_DOWN;
 		}
 		else if (m[0] == 'w') {
 			pendingCommand = Command::VFO_SET;
@@ -311,6 +321,12 @@ extern "C" {
 		}
 		else if (c == Command::BALANCE_DOWN) {
 			balance -= 0.01;
+		}
+		else if (c == Command::PHASE_UP) {
+			phaseAdjust += 0.01;
+		}
+		else if (c == Command::PHASE_DOWN) {
+			phaseAdjust -= 0.01;
 		}
 
 		if (c != Command::NONE) {

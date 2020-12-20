@@ -85,9 +85,12 @@ static float lut[256];
 static unsigned int lutStep = 0;
 // Current pointer in the LUT
 static unsigned int lutPtr = 0;
-// Balance between I/Q
-volatile float balance = 1.0;
+// Balance between I/Q.  This was determined experimentally.
+volatile float balance = 1.02;
 static float gain = 0.75;
+// Phase adjust (I/Q leakage).  This was determined
+// experimentally
+volatile float phaseAdjust = -0.08;
 
 #define FILTER_TAP_NUM 63
 // This is the number of samples that we process in each DMA cycle
@@ -159,7 +162,7 @@ static void moveIn(int inBlock, int outBlockFree) {
 		out_ptr = blockSize * 4;
 	}
 
-	int32_t sample;
+	int32_t sampleI, sampleQ;
 	uint16_t hi;
 	uint16_t lo;
 	float filterIn[FILTER_BLOCK_SIZE];
@@ -173,24 +176,26 @@ static void moveIn(int inBlock, int outBlockFree) {
 		// Read the left channel into the filter
 		// Load the high end of the sample into the high end of the 32-bit number
 		s = in_data[in_ptr++];
-		sample = s;
+		sampleI = s;
 		// Shift up
-		sample = sample << 16;
+		sampleI = sampleI << 16;
 		// Add low end of sample
 		s = in_data[in_ptr++];
-		sample |= s;
-		filterIn[i] = sample;
+		sampleI |= s;
 
 		// Read the right channel into the delay
 		// Load the high end of the sample into the high end of the 32-bit number
 		s = in_data[in_ptr++];
-		sample = s;
+		sampleQ = s;
 		// Shift up
-		sample = sample << 16;
+		sampleQ = sampleQ << 16;
 		// Add low end of sample
 		s = in_data[in_ptr++];
-		sample |= s;
-		delayIn[i] = sample;
+		sampleQ |= s;
+
+		// Allow a small amount of the Q signal into the I for phase adjust
+		filterIn[i] = (float)sampleI + (float)sampleQ * phaseAdjust;
+		delayIn[i] = (float)sampleQ + (float)sampleI * phaseAdjust;
 	}
 
 	// Apply the FIR filter
@@ -211,7 +216,8 @@ static void moveIn(int inBlock, int outBlockFree) {
 		//sample = amp * lut[lutPtr] * gain;
 
 		// Combine Hilbert with Delay
-		sample = (0.5 * balance * filterOut[i]) + (0.5 * delayOut[i]);
+		// This looks like +USB (LSB is canceled)
+		int32_t sample = (0.5 * balance * filterOut[i]) - (0.5 * delayOut[i]);
 
 		// Transfer filtered sample to left output
 		//sample = filterOut[i];
