@@ -77,6 +77,7 @@ static void MX_I2S3_Init(void);
 // Synthesizer
 // Largest value for a 32-bit signed number
 static float amp = 0x7fffffff;
+static float gain = 1.0;
 // Sample frequency
 static const float fs = 44100;
 static const int lut_size = 256;
@@ -87,12 +88,12 @@ static unsigned int lutStep = 0;
 static unsigned int lutPtr = 0;
 // Balance between I/Q.  This was determined experimentally.
 volatile float balance = 1.02;
-static float gain = 0.75;
 // Phase adjust (I/Q leakage).  This was determined
 // experimentally
 volatile float phaseAdjust = -0.08;
 
-#define FILTER_TAP_NUM 63
+//#define FILTER_TAP_NUM 63
+#define FILTER_TAP_NUM 101
 // This is the number of samples that we process in each DMA cycle
 #define FILTER_BLOCK_SIZE 16
 static const int blockSize = FILTER_BLOCK_SIZE;
@@ -185,32 +186,26 @@ static void moveIn(int inBlock, int outBlockFree) {
 	arm_fir_f32(&filter_hilbert_90, filterIn90, filterOut90, blockSize);
 	arm_fir_f32(&filter_hilbert_0, filterIn0, filterOut0, blockSize);
 
-	// Move data out of the circular buffer (lagged)
-	//readDelay(delayOut, blockSize);
-	// Move data into the circular buffer
-	//writeDelay(delayIn, blockSize);
-
 	// Move things into the DMA outbound area
 	for (int i = 0; i < blockSize; i++) {
 
 		// Generate synthesized data by stepping through the cosine table
 		// This handles the wrapping of the LUT pointer:
 		//lutPtr = (lutPtr + lutStep) & 0xff;
-		//sample = amp * lut[lutPtr] * gain;
+		//int32_t sample = amp * lut[lutPtr] * gain;
 
 		// Combine Hilbert with Delay
 		// This looks like +USB (LSB is canceled)
-		int32_t sample = (0.5 * balance * filterOut90[i]) - (0.5 * filterOut0[i]);
+		//int32_t sample = (0.5 * balance * filterOut90[i]) - (0.5 * filterOut0[i]);
+		int32_t sample = filterOut90[i];
 
 		// Transfer filtered sample to left output
-		//sample = filterOut[i];
 		hi = (sample >> 16) & 0xffff;
 		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 
 		// Transfer delayed data to right output
-		//sample = delayOut[i];
 		hi = (sample >> 16) & 0xffff;
 		lo = (sample & 0xffff);
 		out_data[out_ptr++] = hi;
@@ -361,6 +356,8 @@ int main(void)
   	if (data != 8)
   		printf("Problem\r\n");
 
+  	int receiveMode = 0;
+
   	// ===== DAC SETUP ======
 	// Select page 0
 	writeCodec(0x00, 0x00);
@@ -428,24 +425,48 @@ int main(void)
 	writeCodec(0x00, 0x01);
 	// Soft routing 0, De-pop: 5 time constants, 6k resistance
 	writeCodec(0x14, 0b00100101);
-	// Route LDAC/RDAC to HPL/HPR
-	writeCodec(0x0c, 0b00001000);
-	writeCodec(0x0d, 0b00001000);
+	if (receiveMode) {
+		// Route LDAC/RDAC to HPL/HPR
+		writeCodec(0x0c, 0b00001000);
+		writeCodec(0x0d, 0b00001000);
+		// Nothing routed to line out
+		writeCodec(0x0e, 0b00000000);
+		writeCodec(0x0f, 0b00000000);
+
+	} else {
+		// Not routing DAC to HPL/HPR
+		writeCodec(0x0c, 0b00000000);
+		writeCodec(0x0d, 0b00000000);
+		// Route DAC to line out
+		writeCodec(0x0e, 0b00001000);
+		writeCodec(0x0f, 0b00001000);
+	}
 	// Set the DAC PTM mode to PTM_P3/P4
 	writeCodec(0x03, 0x00);
 	writeCodec(0x04, 0x00);
-  	// Unmute HPL/HPR driver (0b01), set 0dB gain
-	// Here is a level control that is not supposed to be used as
-	// the regular volume control.
-	// Range: 0b111010 -> 0b011101
-	writeCodec(0x10, 0b00111010);
-	writeCodec(0x11, 0b00111010);
+	if (receiveMode) {
+		// Unmute HPL/HPR driver (0b01), set 0dB gain
+		// Here is a level control that is not supposed to be used as
+		// the regular volume control.
+		// Range: 0b111010 -> 0b011101
+		writeCodec(0x10, 0b00111010);
+		writeCodec(0x11, 0b00111010);
+	} else {
+		// Unmute LOL/LOR driver, set gain
+		writeCodec(0x12, 0b00000000);
+		writeCodec(0x13, 0b00000000);
+	}
   	// Power configuration.  Output of HPL/HPR powered from LDOIN, range is 1.8V to 3.6V
 	writeCodec(0x0a, 0b00000011);
 	// Overcurrent detection on, debounced = 64ms, driver shut down
 	writeCodec(0x0b, 0b00011001);
-  	// Power up the HPL/HPR
-	writeCodec(0x09, 0b00110000);
+	if (receiveMode) {
+		// Power up the HPL/HPR, power down LOL/LOR
+		writeCodec(0x09, 0b00110000);
+	} else {
+		// No power to the HPL/HPR, power up LOL/LOR
+		writeCodec(0x09, 0b00001100);
+	}
 
 	HAL_Delay(2500);
 
@@ -465,12 +486,19 @@ int main(void)
 	// Configure ADC [Pg. 90 for example]
   	// Select page 1
 	writeCodec(0x00, 0x01);
-	// Route IN1L to left Mic PGA with 20K input impedance [Pg. 135]
-	writeCodec(0x34, 0x80);
+	if (receiveMode) {
+		// Route IN1L to left Mic PGA with 20K input impedance [Pg. 135]
+		writeCodec(0x34, 0x80);
+		// Route IN1R to right Mic PGA with input impedance of 20K [Pg. 135]
+		writeCodec(0x37, 0x80);
+	} else {
+		// Route IN2L to left Mic PGA with 20K input impedance [Pg. 135]
+		writeCodec(0x34, 0b00100000);
+		// Nothing rounted to right PGA
+		writeCodec(0x37, 0x00);
+	}
 	// Route Common Mode to LEFT_M with impedance of 20K
 	writeCodec(0x36, 0x80);
-	// Route IN1R to right Mic PGA with input impedance of 20K [Pg. 135]
-	writeCodec(0x37, 0x80);
 	// Route Common Mode to RIGHT_M with impedance of 20K
 	writeCodec(0x39, 0x80);
 
@@ -777,6 +805,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : GPIO_2_Pin GPIO_3_Pin */
+  GPIO_InitStruct.Pin = GPIO_2_Pin|GPIO_3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 }
 

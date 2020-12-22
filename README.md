@@ -11,3 +11,10 @@ to avoid a clock synchronization bug.  Please see section 2.6.1 in this document
 
 https://www.st.com/resource/en/errata_sheet/dm00037591-stm32f405-407xx-and-stm32f415-417xx-device-limitations-stmicroelectronics.pdf
 
+Filter Notes
+============
+Fs = 44100
+Fc = 1.54
+BW = 3.75
+Kaiser Window (beta 5)
+Raised Cosine 0.86

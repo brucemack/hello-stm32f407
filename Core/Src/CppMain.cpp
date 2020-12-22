@@ -3,6 +3,9 @@
 #include "STM32_HAL_Interface.h"
 #include "si5351.h"
 #include "utils/SerialDriver.h"
+#include "utils/SystemEnv.h"
+#include "utils/Debouncer.h"
+
 #include "main.h"
 
 extern "C" {
@@ -68,6 +71,17 @@ static volatile Command pendingCommand = Command::NONE;
 static int pendingInt = 0;
 // Current VFO
 unsigned int vfoFreq = 7200000;
+
+// For debouncing the encoder
+class Env : public kc1fsz::SystemEnv {
+public:
+	virtual uint32_t getTimeMs() {
+		return HAL_GetTick();
+	}
+};
+
+static Env env;
+static kc1fsz::Debouncer encDebouncer(&env, 10);
 
 void showStatus() {
 
@@ -335,6 +349,31 @@ extern "C" {
 
 		__enable_irq();
 
+	}
+
+	int lastA = 0;
+	int lastB = 0;
+	long lastSample = 0;
+
+	void CppMain_enc(int a, int b) {
+
+		if (HAL_GetTick() - lastSample > 5) {
+			lastSample = HAL_GetTick();
+			// Look for the transition
+			//encDebouncer.loadSample(true);
+			//if (encDebouncer.isEdge()) {
+			if (a != lastA) {
+				if (b != a) {
+					pendingCommand = Command::VFO_UP1000;
+				} else {
+					pendingCommand = Command::VFO_DOWN1000;
+
+				}
+			}
+
+			lastA = a;
+			lastB = b;
+		}
 	}
 }
 
