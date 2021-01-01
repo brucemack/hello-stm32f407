@@ -25,6 +25,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #define ARM_MATH_CM4
 #include "arm_math.h"
@@ -74,38 +75,113 @@ static void MX_I2S3_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Synthesizer
+enum Mode {
+	// Same synthesizer fed into both outputs, inputs ignored, no filter
+	TEST0a,
+	// Two synthesizers fed into both outputs, inputs ignored, no filter
+	TEST0b,
+	// Same synthesizer fed into filters left and right
+	TEST1,
+	// Left input through filters and fed to left/right outputs
+	TEST2,
+	// Left input modulated by software quadrature LO and then through filters and
+	// fed to left/right outputs (Weaver Test)
+	TEST3,
+	TX,
+	RX
+};
+
+enum Mode mode = TEST2;
+
+// COS synthesizer
 // Largest value for a 32-bit signed number
-static float amp = 0x7fffffff;
+float amp = 0x7fffffff;
 static float gain = 1.0;
 // Sample frequency
-static const float fs = 44100;
+static const int fs = 44100;
+
+// ----- cos synthesizer -----------------------------------------------------
+//
+// Size of look-up-table
 static const int lut_size = 256;
 static float lut[256];
-// The number of steps through the synthesis LUT on each cycle
-static unsigned int lutStep = 0;
-// Current pointer in the LUT
-static unsigned int lutPtr = 0;
-// Balance between I/Q.  This was determined experimentally.
-volatile float balance = 1.02;
-// Phase adjust (I/Q leakage).  This was determined
-// experimentally
-volatile float phaseAdjust = -0.08;
+// The phase step through the synthesis LUT on each cycle, based on frequency
+static float lut_phase_step = 0;
+// Tracking phase throughout 0->2PI
+static float lut_phase_I = 0;
+static float lut_phase_Q = 0;
+static const float pi = 3.1415926;
+static const float two_pi = 2.0 * 3.1415926;
+static float lut_size_by_two_pi;
 
-//#define FILTER_TAP_NUM 63
+// Populate synthesizer LUT
+static void setupSynth() {
+	lut_size_by_two_pi = (float)lut_size / two_pi;
+	for (int i = 0; i < lut_size; i++) {
+		float t = (float)i / (float)lut_size;
+		// TODO: Understand the overflow issue here
+		float c = cos(t * two_pi) * 0.95f;
+		lut[i] = c;
+	}
+}
+
+// Sets the frequency of the internal cos() synthesizer
+static void setSynthFreq(int freqHz) {
+	lut_phase_step = ((float)freqHz / (float)fs) * two_pi;
+	lut_phase_Q = pi / 2.0;
+	// Q lags I by 90 degrees
+	lut_phase_I = 0;
+}
+
+// Takes a phase from 0->2PI and converts it to index from 0->lut_size
+static int convertPhaseToIndex(float phase) {
+	int i = phase * lut_size_by_two_pi;
+	return i;
+}
+
+static float getSynthI() {
+	return lut[convertPhaseToIndex(lut_phase_I)];
+}
+
+static float getSynthQ() {
+	return lut[convertPhaseToIndex(lut_phase_Q)];
+}
+
+// Advances the synthesizer to the next value, handling wrap-around as needed
+static void incrementSynth() {
+	lut_phase_I += lut_phase_step;
+	lut_phase_Q += lut_phase_step;
+	// Handle wrap-arounds
+	if (lut_phase_I >= two_pi) {
+		lut_phase_I -= two_pi;
+	}
+	if (lut_phase_Q >= two_pi) {
+		lut_phase_Q -= two_pi;
+	}
+}
+
+// Balance between I/Q.  This was determined experimentally.
+volatile float balanceAdjust = 1.0;
+// Phase adjust (I/Q leakage).  This was determined experimentally
+volatile float phaseAdjust = -0.000;
+//
+volatile int offsetAdjust = 0;
+
 #define FILTER_TAP_NUM 101
 // This is the number of samples that we process in each DMA cycle
-#define FILTER_BLOCK_SIZE 16
+#define FILTER_BLOCK_SIZE 256
 static const int blockSize = FILTER_BLOCK_SIZE;
 
-extern float hilbert_90_filter_taps[FILTER_TAP_NUM];
-extern float hilbert_0_filter_taps[FILTER_TAP_NUM];
+extern float hilbert_plus_45_filter_taps[FILTER_TAP_NUM];
+extern float hilbert_minus_45_filter_taps[FILTER_TAP_NUM];
+extern float lpf_filter_taps[FILTER_TAP_NUM];
 
-static float filter_state_90[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
-static float filter_state_0[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
+static float filter_state_I[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
+static float filter_state_Q[FILTER_TAP_NUM + FILTER_BLOCK_SIZE - 1];
 
-static arm_fir_instance_f32 filter_hilbert_90;
-static arm_fir_instance_f32 filter_hilbert_0;
+static arm_fir_instance_f32 filter_I;
+static arm_fir_instance_f32 filter_Q;
+static arm_rfft_fast_instance_f32 fft_0;
 
 // This where the DMA happens.  We multiply by 8 to address:
 // - The fact that we have left and right data moving through at the same time
@@ -121,10 +197,23 @@ static volatile uint16_t in_data[FILTER_BLOCK_SIZE * 8];
 // on this block.
 static volatile int outBlockFree = 0;
 
-static void setSynthFreq(float freqHz) {
-	float phasePerSample = (freqHz / fs) * 2.0 * 3.14159;
-	lutStep = (phasePerSample / (2.0 * 3.1415926)) * lut_size;
-}
+volatile uint32_t maxBucket;
+volatile float maxFreq;
+volatile float maxMag;
+
+volatile uint32_t max2Bucket;
+volatile float max2Freq;
+volatile float max2Mag;
+
+volatile int32_t maxInputISig;
+volatile int32_t maxInputQSig;
+
+volatile int32_t maxOutputISig;
+volatile int32_t maxOutputQSig;
+
+#define FFT_SIZE FILTER_BLOCK_SIZE
+const int fftSize = FFT_SIZE;
+volatile float mags[FFT_SIZE / 2 - 1];
 
 // This reads half of the inbound data from the DMA buffer.  This is
 // called by the DMA interrupt at the half-way point through the
@@ -148,15 +237,18 @@ static void moveIn(int inBlock, int outBlockFree) {
 	int32_t sampleI, sampleQ;
 	uint16_t hi;
 	uint16_t lo;
-	float filterIn90[FILTER_BLOCK_SIZE];
-	float filterOut90[FILTER_BLOCK_SIZE];
-	float filterIn0[FILTER_BLOCK_SIZE];
-	float filterOut0[FILTER_BLOCK_SIZE];
-	uint16_t s;
+	float filterInI[FILTER_BLOCK_SIZE];
+	float filterOutI[FILTER_BLOCK_SIZE];
+	float filterInQ[FILTER_BLOCK_SIZE];
+	float filterOutQ[FILTER_BLOCK_SIZE];
+	float fftIn[FILTER_BLOCK_SIZE];
+	float fftOut[FILTER_BLOCK_SIZE];
 
 	for (int i = 0; i < blockSize; i++) {
 
-		// Read the left channel into the filter
+		uint16_t s;
+
+		// Read the left channel
 		// Load the high end of the sample into the high end of the 32-bit number
 		s = in_data[in_ptr++];
 		sampleI = s;
@@ -166,7 +258,11 @@ static void moveIn(int inBlock, int outBlockFree) {
 		s = in_data[in_ptr++];
 		sampleI |= s;
 
-		// Read the right channel into the delay
+		if (abs(sampleI) > maxInputISig) {
+			maxInputISig = abs(sampleI);
+		}
+
+		// Read the right channel
 		// Load the high end of the sample into the high end of the 32-bit number
 		s = in_data[in_ptr++];
 		sampleQ = s;
@@ -176,40 +272,127 @@ static void moveIn(int inBlock, int outBlockFree) {
 		s = in_data[in_ptr++];
 		sampleQ |= s;
 
-		// Allow a small amount of the Q signal into the I for phase adjust
-		filterIn90[i] = (float)sampleI + (float)sampleQ * phaseAdjust;
-		filterIn0[i] = (float)sampleQ + (float)sampleI * phaseAdjust;
+		if (abs(sampleQ) > maxInputQSig) {
+			maxInputQSig = abs(sampleQ);
+		}
+
+		fftIn[i] = (float)sampleI;
+
+		if (mode == TEST0a) {
+			float a = getSynthI();
+			// Feed the synthesized wave into the output
+			filterOutI[i] = amp * a;
+			filterOutQ[i] = amp * a;
+		} else if (mode == TEST0b) {
+			// Feed the synthesized wave into the output
+			filterOutI[i] = amp * getSynthI();
+			filterOutQ[i] = amp * getSynthQ();
+		} else if (mode == TEST1) {
+			// Feed the synthesized wave unto both filters
+			filterInI[i] = amp * getSynthI();
+			filterInQ[i] = amp * getSynthI();
+		} else if (mode == TEST2) {
+			// Feed the input wave unto both filters
+			// NOTE: Left channel being fed to both filters!
+			filterInI[i] = sampleI;
+			filterInQ[i] = sampleI;
+		} else if (mode == TEST3) {
+			// Input sample modulated by software LO
+			filterInI[i] = sampleI * getSynthI();
+			filterInQ[i] = sampleI * getSynthQ();
+		} else if (mode == RX) {
+			// Allow a small amount of the Q signal into the I for phase adjust
+			filterInI[i] = (float)sampleI + (float)sampleQ * phaseAdjust;
+			filterInQ[i] = (float)sampleQ + (float)sampleI * phaseAdjust;
+		} else if (mode == TX) {
+			// Multiply I/Q by the first stage of modulation and load into the LPF
+			// SAME INPUT BEING USED ON BOTH SIDES
+			filterInI[i] = (float)sampleI * getSynthI();
+			filterInQ[i] = (float)sampleI * getSynthQ();
+		}
+
+		// Move the modulation synthesizer forward
+		incrementSynth();
 	}
 
+	// Run the FFT.  This creates a result with fftSize / 2 complex values
+	// (assuming spectral symmetry)
+	arm_rfft_fast_f32(&fft_0, fftIn, fftOut, 0);
+	// Get the magnitude data.  Note that the first pair of values from
+	// the FFT is ignored (real DC, real N/2)
+	arm_cmplx_mag_f32(fftOut + 2, mags, fftSize / 2 - 1);
+
+	// Get the largest two buckets
+	maxBucket = 0;
+	maxMag = 0;
+	maxFreq = 0;
+	max2Bucket = 0;
+	max2Mag = 0;
+	max2Freq = 0;
+
+	for (int i = 0; i < fftSize / 2 - 1; i++) {
+		if (mags[i] >= maxMag) {
+			// Move previous max down to second place
+			max2Mag = maxMag;
+			max2Bucket = maxBucket;
+			// Track the new first place			}
+			maxMag = mags[i];
+			maxBucket = i;
+		} else if (mags[i] >= max2Mag) {
+			max2Mag = mags[i];
+			max2Bucket = i;
+		}
+	}
+
+	float resolution = (float)fs / (float)fftSize;
+	maxFreq = (float)(maxBucket + 1) * resolution;
+	max2Freq = (float)(max2Bucket + 1) * resolution;
+
 	// Apply the FIR filter
-	// MEASUREMENT: This takes about 4,000 cycles.
-	arm_fir_f32(&filter_hilbert_90, filterIn90, filterOut90, blockSize);
-	arm_fir_f32(&filter_hilbert_0, filterIn0, filterOut0, blockSize);
+	if (mode != TEST0a && mode != TEST0b) {
+		arm_fir_f32(&filter_I, filterInI, filterOutI, blockSize);
+		arm_fir_f32(&filter_Q, filterInQ, filterOutQ, blockSize);
+	}
 
 	// Move things into the DMA outbound area
 	for (int i = 0; i < blockSize; i++) {
 
-		// Generate synthesized data by stepping through the cosine table
-		// This handles the wrapping of the LUT pointer:
-		//lutPtr = (lutPtr + lutStep) & 0xff;
-		//int32_t sample = amp * lut[lutPtr] * gain;
-
-		// Combine Hilbert with Delay
-		// This looks like +USB (LSB is canceled)
-		//int32_t sample = (0.5 * balance * filterOut90[i]) - (0.5 * filterOut0[i]);
-		int32_t sample = filterOut90[i];
+		if (mode == TEST0a || mode == TEST0b) {
+			sampleI = filterOutI[i];
+			sampleQ = filterOutQ[i];
+		} else if (mode == TEST1 || mode == TEST2 || mode == TEST3) {
+			sampleI = (balanceAdjust * filterOutI[i]) + (phaseAdjust * filterOutQ[i]);
+			sampleQ = filterOutQ[i] + (phaseAdjust * filterOutI[i]);
+		} else if (mode == RX) {
+			// This looks like +USB (LSB is canceled)
+			sampleI = (0.5 * balanceAdjust * filterOutI[i]) - (0.5 * filterOutQ[i]);
+			sampleQ = sampleI;
+		} else if (mode == TX) {
+			// Inject a small amount of Q into the I channel for phase adjustment
+			sampleI = (balanceAdjust * filterOutI[i]) + (phaseAdjust * filterOutQ[i]);
+			// Inject a small amount of I into the Q channel for phase adjustment
+			sampleQ = (filterOutQ[i]) + (phaseAdjust * filterOutI[i]);
+		}
 
 		// Transfer filtered sample to left output
-		hi = (sample >> 16) & 0xffff;
-		lo = (sample & 0xffff);
+		hi = (sampleI >> 16) & 0xffff;
+		lo = (sampleI & 0xffff);
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
 
+		if (abs(sampleI) > maxOutputISig) {
+			maxOutputISig = abs(sampleI);
+		}
+
 		// Transfer delayed data to right output
-		hi = (sample >> 16) & 0xffff;
-		lo = (sample & 0xffff);
+		hi = (sampleQ >> 16) & 0xffff;
+		lo = (sampleQ & 0xffff);
 		out_data[out_ptr++] = hi;
 		out_data[out_ptr++] = lo;
+
+		if (abs(sampleQ) > maxOutputQSig) {
+			maxOutputQSig = abs(sampleQ);
+		}
 	}
 }
 
@@ -271,7 +454,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -293,9 +476,13 @@ int main(void)
   MX_I2S3_Init();
   /* USER CODE BEGIN 2 */
 
-	// Initialize the filter
-	arm_fir_init_f32(&filter_hilbert_90, FILTER_TAP_NUM, hilbert_90_filter_taps, filter_state_90, FILTER_BLOCK_SIZE);
-	arm_fir_init_f32(&filter_hilbert_0, FILTER_TAP_NUM, hilbert_0_filter_taps, filter_state_0, FILTER_BLOCK_SIZE);
+	// Initialize the filters
+//	arm_fir_init_f32(&filter_I, FILTER_TAP_NUM, lpf_filter_taps, filter_state_I, FILTER_BLOCK_SIZE);
+//	arm_fir_init_f32(&filter_Q, FILTER_TAP_NUM, lpf_filter_taps, filter_state_Q, FILTER_BLOCK_SIZE);
+	arm_fir_init_f32(&filter_I, FILTER_TAP_NUM, hilbert_plus_45_filter_taps, filter_state_I, FILTER_BLOCK_SIZE);
+	arm_fir_init_f32(&filter_Q, FILTER_TAP_NUM, hilbert_minus_45_filter_taps, filter_state_Q, FILTER_BLOCK_SIZE);
+
+	arm_rfft_fast_init_f32(&fft_0, 256);
 
 	HAL_StatusTypeDef status;
 	uint8_t devAddr = 0x60 << 1;
@@ -310,8 +497,11 @@ int main(void)
 
 	CppMain_setup();
 
+	setupSynth();
+	setSynthFreq(2000);
+
 	// ----- CODEC INIT ---------------------------------------------------
-	// Harware reset the CODEC
+	// Hardware reset the CODEC
 	HAL_GPIO_WritePin(CODEC_RESET_GPIO_Port, CODEC_RESET_Pin, 1);
 	HAL_GPIO_WritePin(CODEC_RESET_GPIO_Port, CODEC_RESET_Pin, 0);
 	HAL_GPIO_WritePin(CODEC_RESET_GPIO_Port, CODEC_RESET_Pin, 1);
@@ -494,6 +684,8 @@ int main(void)
 	} else {
 		// Route IN2L to left Mic PGA with 20K input impedance [Pg. 135]
 		writeCodec(0x34, 0b00100000);
+		// TURN OFF INPUT:
+		//writeCodec(0x34, 0b00000000);
 		// Nothing rounted to right PGA
 		writeCodec(0x37, 0x00);
 	}
@@ -503,8 +695,10 @@ int main(void)
 	writeCodec(0x39, 0x80);
 
 	// Unmute left MICPGA, set gain to 6dB (given that input impedance is 20k => 0dB)
+	// [Pg. 137]
 	writeCodec(0x3b, 0x0c);
 	// Unmute right MICPGA, set gain to 6dB (given that input impedance is 20k => 0dB)
+	// [Pg. 137]
 	writeCodec(0x3c, 0x0c);
 
 	// Page 0
@@ -527,14 +721,6 @@ int main(void)
 	//writeCodec(0x1d, data);
 	// *******************************************
 
-	// Populate synthesizer LUT
-	for (int i = 0; i < lut_size; i++) {
-		float t = (float)i / (float)lut_size;
-		float a = t * 2.0 * 3.1315926;
-		lut[i] = cos(a);
-	}
-
-	setSynthFreq(2000);
 
     // Initialize DMA
 	// IPORTANT: Because of a bug in STM32F407, we must always enable the

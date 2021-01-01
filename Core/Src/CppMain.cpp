@@ -18,8 +18,24 @@ extern "C" {
 	void __enable_irq();
 	void __disable_irq();
 
-	extern float balance;
+	extern float balanceAdjust;
 	extern float phaseAdjust;
+	extern int offsetAdjust;
+
+	extern float maxFreq;
+	extern float maxMag;
+	extern uint32_t maxBucket;
+	extern float max2Freq;
+	extern float max2Mag;
+	extern uint32_t max2Bucket;
+	extern int32_t maxInputISig;
+	extern int32_t maxInputQSig;
+	extern int32_t maxOutputISig;
+	extern int32_t maxOutputQSig;
+	extern float mags[];
+
+	extern float amp;
+	extern int fftSize;
 }
 
 int8_t getHPLGain();
@@ -59,7 +75,9 @@ enum Command {
 	BALANCE_UP,
 	BALANCE_DOWN,
 	PHASE_UP,
-	PHASE_DOWN
+	PHASE_DOWN,
+	OFFSET_UP,
+	OFFSET_DOWN
 };
 
 static STM32_HAL_Interface i2c_interface(&hi2c1);
@@ -70,7 +88,7 @@ static SerialDriver sd1(&huart1);
 static volatile Command pendingCommand = Command::NONE;
 static int pendingInt = 0;
 // Current VFO
-unsigned int vfoFreq = 7200000;
+unsigned int vfoFreq = 1200000;
 
 // For debouncing the encoder
 class Env : public kc1fsz::SystemEnv {
@@ -99,16 +117,17 @@ void showStatus() {
 		(int)getPGARGain(),
 		(int)getADCLVolume(),
 		(int)getADCRVolume());
-	printf("  Balance (x100): %d\r\n", (int)(balance * 100.0));
-	printf("  Phase (x100): %d\r\n", (int)(phaseAdjust * 100.0));
+	printf("  Balance (x100): %d\r\n", (int)(balanceAdjust * 100.0));
+	printf("  Phase (x1000)  : %d\r\n", (int)(phaseAdjust * 1000.0));
+	printf("  Offset        : %d\r\n", offsetAdjust);
 
-	// Sticky flags 1
+	// Page 0
 	writeCodec(0x00, 0x00);
-	uint8_t flags = readCodec(0x2c);
+
 	printf("CODEC Status flags:\r\n");
 
-	// Sticky flags 2
-	flags = readCodec(0x2c);
+	// Sticky flags 1
+	uint8_t flags = readCodec(0x2a);
 
 	printf("  DACL Overflow   : ");
 	if (flags & 0b10000000) {
@@ -140,6 +159,9 @@ void showStatus() {
 	}
 	printf("\r\n");
 
+	// Sticky flags 2
+	flags = readCodec(0x2c);
+
 	printf("  HPL Over Current: ");
 	if (flags & 0b10000000) {
 		printf("Detected");
@@ -154,6 +176,54 @@ void showStatus() {
 		printf("Clear");
 	}
 	printf("\r\n");
+
+	// ADC flags
+	flags = readCodec(0x24);
+
+	printf("  ADCL Saturated  : ");
+	if (flags & 0b00100000) {
+		printf("Detected");
+	} else {
+		printf("Clear");
+	}
+	printf("\r\n");
+
+	printf("  ADCR Saturated  : ");
+	if (flags & 0b00000010) {
+		printf("Detected");
+	} else {
+		printf("Clear");
+	}
+	printf("\r\n");
+
+	printf("MaxBucket %d, MaxFreq %d, MaxMag %d\r\n",
+		(int)maxBucket, (int)maxFreq, (int)(maxMag / ((float)fftSize / 4.0)));
+	printf("Max2Bucket %d, Max2Freq %d, Max2Mag %d\r\n",
+		(int)max2Bucket, (int)max2Freq, (int)(max2Mag / ((float)fftSize / 4.0)));
+
+	int maxInputISigPercent = (float)100 * (maxInputISig / amp);
+	printf("MaxInputI %d, MaxInputIPercent %d\r\n",
+		(int)maxInputISig, maxInputISigPercent);
+	/*
+	for (int i = 0; i < 127; i++) {
+		float mag = mags[i] / (fftSize / 4);
+		printf("%d = %d, %d\r\n", i, (int)mag, (int)((100.0 * mag) / amp));
+	}
+	*/
+
+	int maxOutputISigPercent = (float)100 * (maxOutputISig / amp);
+	int maxOutputQSigPercent = (float)100 * (maxOutputQSig / amp);
+
+	printf("MaxOutputI %d, MaxOutputIPercent %d\r\n",
+		(int)maxOutputISig, maxOutputISigPercent);
+	printf("MaxOutputQ %d, MaxOutputQPercent %d\r\n",
+		(int)maxOutputQSig, maxOutputQSigPercent);
+
+	// Reset trace
+	maxInputISig = 0;
+	maxInputQSig = 0;
+	maxOutputISig = 0;
+	maxOutputQSig = 0;
 }
 
 class TestHandler : public MessageHandler {
@@ -210,6 +280,12 @@ public:
 		else if (m[0] == 'm') {
 			pendingCommand = Command::PHASE_DOWN;
 		}
+		else if (m[0] == 'k') {
+			pendingCommand = Command::OFFSET_UP;
+		}
+		else if (m[0] == ',') {
+			pendingCommand = Command::OFFSET_DOWN;
+		}
 		else if (m[0] == 'w') {
 			pendingCommand = Command::VFO_SET;
 			pendingInt = atoi(m + 2);
@@ -248,7 +324,11 @@ extern "C" {
 
 		bool i2c_found = si5351.init(SI5351_CRYSTAL_LOAD_8PF, 0, 0);
 		if (i2c_found) {
-			setVFO(7200000);
+			setVFO(1300000);
+			si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_8MA);
+			// Clock 2 is used by the up-converter
+			si5351.set_freq((unsigned long long)(21000000) * 100ULL, SI5351_CLK2);
+			si5351.drive_strength(SI5351_CLK2, SI5351_DRIVE_8MA);
 		} else {
 		  printf("Si5351 initialization failed\r\n");
 		}
@@ -331,16 +411,22 @@ extern "C" {
 			setVFO(pendingInt);
 		}
 		else if (c == Command::BALANCE_UP) {
-			balance += 0.01;
+			balanceAdjust += 0.01;
 		}
 		else if (c == Command::BALANCE_DOWN) {
-			balance -= 0.01;
+			balanceAdjust -= 0.01;
 		}
 		else if (c == Command::PHASE_UP) {
-			phaseAdjust += 0.01;
+			phaseAdjust += 0.005;
 		}
 		else if (c == Command::PHASE_DOWN) {
-			phaseAdjust -= 0.01;
+			phaseAdjust -= 0.005;
+		}
+		else if (c == Command::OFFSET_UP) {
+			offsetAdjust += 1;
+		}
+		else if (c == Command::OFFSET_DOWN) {
+			offsetAdjust -= 1;
 		}
 
 		if (c != Command::NONE) {
